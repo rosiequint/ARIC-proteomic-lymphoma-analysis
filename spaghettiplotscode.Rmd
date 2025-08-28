@@ -1,0 +1,421 @@
+---
+title: "Protein spaghetti plots"
+output:
+  pdf_document: default
+  html_document: default
+date: "2025-08-21"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Prepare data and filter by cancer status
+
+Load libraries and main dataset
+```{r}
+library(tidyverse)
+library(ggplot2)
+library(cowplot)
+library(purrr)
+
+# load main dataset (has all observations)
+baseline_protein_cancer_data <- read_csv("//win.ad.jhu.edu/Users$/HOME/WINDOWS/uvdi/Desktop/Personal/working_data.csv")
+```
+
+Create new cancer variables and filtered datasets by cancer status
+```{r}
+# create new variables for anylymph, mm, cll, bnhl
+cancer_data_plot <- baseline_protein_cancer_data %>%
+  mutate(
+    anylymph = ifelse(lym_anyinc == 1, 1, 0),
+    mm_cancer = ifelse(mye_lym1 == "Lymphoid (MM)", 1, 0),
+    cll_cancer = ifelse(mye_lym1 == "Lymphoid (CLL)", 1, 0),
+    bnhl_cancer = ifelse(mye_lym1 == "Lymphoid (B-NHL)", 1, 0)
+  )
+```
+
+Add information about last visit before diagnosis (useful for matching controls)
+```{r}
+# find the last visit before they got cancer (ie last nonnegative time to diagnosis)
+cancer_data_plot <- cancer_data_plot %>%
+  rowwise() %>%
+  mutate(
+    last_visit_b4_diag = case_when(
+      lyminc_t_v5 >= 0 ~ 5,
+      lyminc_t_v3 >= 0 ~ 3,
+      lyminc_t_v2 >= 0 ~ 2,
+      TRUE ~ NA_real_
+    ),
+    last_visit_time_to_diag = case_when(
+      last_visit_b4_diag == 5 ~ lyminc_t_v5,
+      last_visit_b4_diag == 3 ~ lyminc_t_v3,
+      last_visit_b4_diag == 2 ~ lyminc_t_v2,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  ungroup()
+```
+
+Create filtered datasets by cancer status
+```{r}
+non_cancer_patients <- cancer_data_plot %>%
+  filter(anylymph == 0) %>% # non-cancer patients
+  filter(!is.na(last_visit_b4_diag)) # remove those where last visit before diagnosis is NA (ie they have no nonnegative time to diagnosis)
+mm_cases <- cancer_data_plot %>%
+  filter(mm_cancer == 1) %>% # mm = multiple myeloma
+  filter(!is.na(last_visit_b4_diag)) # remove those where last visit before diagnosis is NA (ie they have no nonnegative time to diagnosis)
+cll_cases <- cancer_data_plot %>%
+  filter(cll_cancer == 1) %>% # cll = chronic lymphocytic leukemia
+  filter(!is.na(last_visit_b4_diag)) # remove those where last visit before diagnosis is NA (ie they have no nonnegative time to diagnosis)
+bnhl_cases <- cancer_data_plot %>%
+  filter(bnhl_cancer == 1) %>% # b-nhl includes follicular lymphoma (FL) and diffuse large b-cell lymphoma (dlbcl)
+  filter(!is.na(last_visit_b4_diag)) # remove those where last visit before diagnosis is NA (ie they have no nonnegative time to diagnosis)
+```
+
+
+## Find matched controls
+For every single person find their last recorded visit before diagnosis, and time to diagnosis at that visit
+
+```{r}
+get_risk_set <- function(case_row, df = non_cancer_patients) {
+  case_timeto <- case_row$last_visit_time_to_diag
+
+  # Define the visit time columns
+  time_cols <- c("lyminc_t_v2", "lyminc_t_v3", "lyminc_t_v5")
+  visit_names <- c("v2", "v3", "v5")
+  
+  # Identify latest eligible visit time per row
+  eligible_visits <- df %>%
+    rowwise() %>%
+    mutate(
+      # Create a named vector of visit times
+      valid_times = list({
+        vt <- c(
+          v2 = lyminc_t_v2,
+          v3 = lyminc_t_v3,
+          v5 = lyminc_t_v5
+        )
+        vt[!is.na(vt) & vt >= case_timeto]  # keep only non-NA times that are >= case's time to diagnosis
+      }),
+      latest_valid_visit = if (length(valid_times) > 0) names(valid_times)[which.min(valid_times)] else NA_character_, # if there is at least one valid visit time in valid_times, it selects the smallest one (ie closest to case's), otherwise NA
+      last_visit_time_to_diag = if (!is.na(latest_valid_visit)) valid_times[[latest_valid_visit]] else NA_real_,
+      last_visit_b4_diag = if (!is.na(latest_valid_visit)) as.numeric(sub("v", "", latest_valid_visit)) else NA_real_
+    ) %>%
+    ungroup() %>%
+    filter(!is.na(last_visit_b4_diag)) %>%  # only keep eligible controls
+    select(-valid_times)  # cleanup temporary column
+  
+  return(eligible_visits)
+}
+```
+
+```{r}
+# apply to all cases -> get a list of risk sets
+risk_sets_mm <- lapply(1:nrow(mm_cases), function(i) get_risk_set(mm_cases[i,]))
+risk_sets_cll <- lapply(1:nrow(cll_cases), function(i) get_risk_set(cll_cases[i,]))
+risk_sets_bnhl <- lapply(1:nrow(bnhl_cases), function(i) get_risk_set(bnhl_cases[i,]))
+```
+
+
+```{r}
+rs_test <- get_risk_set(mm_cases[12, ])
+print(mm_cases[12, ]) 
+head(rs_test)
+```
+
+
+
+Select a random control from each risk set
+```{r}
+set.seed(123) # for reproducibility
+
+mm_controls <- do.call(rbind, lapply(risk_sets_mm, function(rs) rs[sample(nrow(rs), 1), ]))
+cll_controls <- do.call(rbind, lapply(risk_sets_cll, function(rs) rs[sample(nrow(rs), 1), ]))
+bnhl_controls <- do.call(rbind, lapply(risk_sets_bnhl, function(rs) rs[sample(nrow(rs), 1), ]))
+```
+
+## Create data frame for proteins/cancers of interest
+Create data frame to map proteins of interest with cancers of interest
+```{r}
+df_protein_mapping <- tibble::tibble (
+  protein_seqid = c("SeqId_2665_26", "SeqId_16322_10", "SeqId_3292_75", "SeqId_7849_3", "SeqId_2704_74", "SeqId_3291_30", "SeqId_6574_11", "SeqId_16915_153", "SeqId_3291_30", "SeqId_3487_32", "SeqId_17346_61", "SeqId_7266_4"), 
+  outcome = c("mm", "mm", "mm", "mm", "mm", "cll", "cll", "cll", "bnhl", "bnhl", "bnhl", "bnhl")
+  )
+```
+
+Non non cancer
+```{r}
+no_cancer_atall <- cancer_data_plot %>%
+  filter(anycancer == 0) # non-cancer patients
+```
+
+
+
+
+## Spaghetti plots for protein levels 
+
+Create a function
+
+```{r}
+# define function 
+spaghetti_plot_timeto <- function(outcome, protein_seqid, id_var = "subjectid", cases = TRUE, n_sample = NULL, line_colour = "black") {
+  
+  # construct dataset name based on outcome and case/control flag
+  data_obj_name <- paste0(outcome, ifelse(cases, "_cases", "_controls"))
+  
+  # try to get the dataset from the global environment
+  if (!exists(data_obj_name, envir = .GlobalEnv)) {
+    stop(paste("Dataset", data_obj_name, "not found in the global environment."))
+  }
+  data <- get(data_obj_name, envir = .GlobalEnv)
+  
+  # label for plot title 
+  case_label <- ifelse(cases, "cases", "controls")
+  
+  
+   # identify protein and time columns
+  visit_cols <- paste0(c("v2_", "v3_", "v5_"), protein_seqid)
+  time_cols <- c("lyminc_t_v2", "lyminc_t_v3", "lyminc_t_v5")
+  
+  # check required columns exist
+  if (!all(visit_cols %in% names(data))) {
+    stop("Some protein columns for this protein are missing from the dataset.")
+  }
+  if (!all(time_cols %in% names(data))) {
+    stop("Some time-to-diagnosis columns are missing from the dataset.")
+  }
+  
+  # fetch both case and control datasets
+  data_cases <- get(paste0(outcome, "_cases"), envir = .GlobalEnv)
+  data_controls <- get(paste0(outcome, "_controls"), envir = .GlobalEnv)
+  # extract all protein values for this protein_seqid
+  protein_vals_cases <- unlist(data_cases[visit_cols])
+  protein_vals_controls <- unlist(data_controls[visit_cols])
+  # combine and remove NAs, and get global min and max
+  all_protein_vals <- c(protein_vals_cases, protein_vals_controls)
+  all_protein_vals <- all_protein_vals[!is.na(all_protein_vals)]
+  ymin <- min(all_protein_vals)
+  ymax <- max(all_protein_vals)
+  
+
+  # if n_sample specified, generate random sample of ids
+  if (!is.null(n_sample)) {
+    sampled_ids <- sample(unique(data[[id_var]]), n_sample)
+    data <- data %>%
+      filter(.data[[id_var]] %in% sampled_ids)
+    sample_text <- paste("random sample of", length(sampled_ids))
+  } else {
+    sample_text <- "all individuals"
+  }
+
+  
+    # keep only rows with at least two protein measurements
+  data_filtered <- data %>%
+    filter(rowSums(!is.na(across(all_of(visit_cols)))) >= 2) %>% # takes all protein columns, turns them into TRUE/FALSE for 'not missing', sums TRUEs per row, keeps rows with at least 2 TRUEs
+    select(all_of(c(id_var, visit_cols, time_cols)))
+  
+  # reshape protein and time data to long format
+  data_long_protein <- data_filtered %>%
+    pivot_longer(cols = all_of(visit_cols), names_to = "visit", values_to = "protein")
+  
+  # put time to diagnosis data in long format
+  data_long_time <- data_filtered %>%
+    pivot_longer(cols = all_of(time_cols), names_to = "visit_time", values_to = "time_to_dx")
+  
+  # extract visit labels from column names
+  data_long_protein <- data_long_protein %>%
+    mutate(visit_label = gsub(paste0("v(2|3|5)_", protein_seqid), "v\\1", visit))
+  
+  data_long_time <- data_long_time %>%
+    mutate(visit_label = gsub("lyminc_t_v(2|3|5)", "v\\1", visit_time))
+  
+  # merge by subject ID and visit label
+  data_long <- data_long_protein %>%
+    left_join(data_long_time, by = c(id_var, "visit_label"))
+  
+  # plot
+  ggplot(data_long, aes(x = time_to_dx, y = protein, group = .data[[id_var]], color = factor(.data[[id_var]]))) + 
+    geom_line(colour = line_colour, alpha = 0.8) + 
+    geom_point() + 
+    theme_minimal() + 
+    labs(
+      x = "Time to Diagnosis or End of Follow-up (years)",
+      y = paste0("Protein (", protein_seqid, ")"),
+      title = paste("Spaghetti plot of", protein_seqid, "from", outcome, "-", case_label, "(", sample_text, ")")
+    ) +
+    scale_x_reverse(limits = c(30, 0)) +
+    coord_cartesian(ylim = c(ymin, ymax)) +
+    theme(legend.position = "none")
+}
+  
+```
+
+Example use of function
+
+```{r}
+# example for SeqId_2665_26
+spaghetti_plot_timeto(outcome = "mm", "SeqId_2665_26", line_colour = "lightblue")
+spaghetti_plot_timeto("mm", "SeqId_2665_26", cases = FALSE, line_colour = "black")
+
+```
+
+Making cancer plots
+
+```{r}
+plots_cancer_timeto <- df_protein_mapping %>%
+  pmap(function(protein_seqid, outcome) {
+    spaghetti_plot_timeto(outcome = outcome, protein_seqid = protein_seqid, cases = TRUE, line_colour = "blue")
+  })
+
+plots_cancer_timeto
+```
+
+
+
+```{R}
+plots_control_timeto <- df_protein_mapping %>%
+  pmap(function(protein_seqid, outcome) {
+    spaghetti_plot_timeto(outcome = outcome, protein_seqid = protein_seqid, cases = FALSE, line_colour = "black")
+  })
+
+plots_control_timeto
+```
+
+Make pdf
+
+```{r}
+pdf("spaghetti_plots_timeto.pdf", width = 8, height = 6)
+
+for(i in seq_along(plots_cancer_timeto)) {
+  print(plots_cancer_timeto[[i]])
+  print(plots_control_timeto[[i]])
+}
+dev.off()
+```
+
+Proteins: MM: SeqId_2665_26, SeqId_16322_10, SeqId_3292_75, SeqId_7849_3, SeqId_2704_74 CLL: SeqId_3291_30, SeqId_6574_11, SeqId_16915_153 FL: SeqId_3291_30, SeqId_3487_32, SeqId_17346_61, SeqId_7266_4 DLBCL: SeqId_3487_32, SeqId_17346_61
+
+Time until diagnosis: lyminc_t_v2 = time (in years) from visit 2 to lymphoid cancer diagnosis etc etc
+
+
+# Spaghetti plots by visit
+
+```{r}
+# define function 
+spaghetti_plot_visits <- function(outcome, protein_seqid, id_var = "subjectid", cases = TRUE, n_sample = NULL, line_colour = "black") {
+  
+  # construct dataset name based on outcome and case/control flag
+  data_obj_name <- paste0(outcome, ifelse(cases, "_cases", "_controls")) 
+  
+  # try to get the dataset from the global environment
+  if (!exists(data_obj_name, envir = .GlobalEnv)) {
+    stop(paste("Dataset", data_obj_name, "not found in the global environment."))
+  }
+  
+  data <- get(data_obj_name, envir = .GlobalEnv)
+  
+  # label for plot title 
+  case_label <- ifelse(cases, "cases", "controls")
+  
+   # identify protein coulmns
+  visit_cols <- paste0(c("v2_", "v3_", "v5_"), protein_seqid)
+  
+  # check required columns exist
+  if (!all(visit_cols %in% names(data))) {
+    stop("Some protein columns for this protein are missing from the dataset.")
+  }
+ 
+  # fetch both case and control datasets
+  data_cases <- get(paste0(outcome, "_cases"), envir = .GlobalEnv)
+  data_controls <- get(paste0(outcome, "_controls"), envir = .GlobalEnv)
+  # extract all protein values for this protein_seqid
+  protein_vals_cases <- unlist(data_cases[visit_cols])
+  protein_vals_controls <- unlist(data_controls[visit_cols])
+  # combine and remove NAs, and get global min and max
+  all_protein_vals <- c(protein_vals_cases, protein_vals_controls)
+  all_protein_vals <- all_protein_vals[!is.na(all_protein_vals)]
+  ymin <- min(all_protein_vals)
+  ymax <- max(all_protein_vals)
+  
+  # if n_sample specified, generate random sample of ids
+  if (!is.null(n_sample)) {
+    sampled_ids <- sample(unique(data[[id_var]]), n_sample)
+    data <- data %>%
+      filter(.data[[id_var]] %in% sampled_ids)
+    sample_text <- paste("random sample of", length(sampled_ids))
+  } else {
+    sample_text <- "all individuals"
+  }
+    
+  # keep only rows with at least two protein measurements
+  data_filtered <- data %>%
+    filter(rowSums(!is.na(select(., all_of(visit_cols)))) >= 2) # takes all protein columns, turns them into TRUE/FALSE for 'not missing', sums TRUEs per row, keeps rows with at least 2 TRUEs
+
+  # filter the cancer_data_plot for these IDs and reshape to long format
+  data_long <- data %>%
+    select(all_of(c(id_var, visit_cols))) %>%
+    pivot_longer(cols = all_of(visit_cols), names_to = "visit", values_to = "protein") %>%
+    mutate(
+      visit = case_when(
+        grepl("^v2_", visit) ~ 2,
+        grepl("^v3_", visit) ~ 3,
+        grepl("^v5_", visit) ~ 5
+      )
+    )
+
+  # plot
+  ggplot(data_long, aes(x = visit, y = protein, group = .data[[id_var]], color = factor(.data[[id_var]]))) + 
+    geom_line(colour = line_colour, alpha = 0.8) + 
+    geom_point() + 
+    theme_minimal() + 
+    labs(
+      x = "Visit",
+      y = paste0("Protein (", protein_seqid, ")"),
+      title = paste("Spaghetti plot of", protein_seqid, "from", outcome, "-", case_label, "(", sample_text, ")")
+    ) +
+    coord_cartesian(ylim = c(ymin, ymax)) +
+    theme(legend.position = "none")
+}
+```
+
+Test out function
+```{r}
+# example for SeqId_2665_26
+spaghetti_plot_visits("mm", "SeqId_2665_26", line_colour = "lightblue", cases = TRUE)
+spaghetti_plot_visits("mm", "SeqId_2665_26", cases = FALSE)
+```
+
+
+Making cancer plots
+
+```{r}
+plots_cancer <- df_protein_mapping %>%
+  pmap(function(protein_seqid, outcome) {
+    spaghetti_plot_visits(outcome = outcome, protein_seqid = protein_seqid, cases = TRUE, line_colour = "blue")
+  })
+
+```
+
+Control plots
+
+```{r}
+plots_control <- df_protein_mapping %>%
+  pmap(function(protein_seqid, outcome) {
+    spaghetti_plot_visits(outcome = outcome, protein_seqid = protein_seqid, cases = FALSE)
+  })
+```
+  
+Make pdf
+
+
+```{r}
+pdf("spaghetti_plots_visits.pdf", width = 8, height = 6)
+
+for(i in seq_along(plots_cancer)) {
+  print(plots_cancer[[i]])
+  print(plots_control[[i]])
+}
+dev.off()
+```
+

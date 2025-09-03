@@ -1,0 +1,482 @@
+---
+title: "TDC protein velocity"
+output: html_document
+date: "2025-08-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load necessary libraries 
+```{r}
+library(tidyverse)
+library(survival)
+library(broom)
+```
+
+
+Prep the data 
+```{r}
+# load cancer, protein, and followup time data
+cancer_data <- read_csv("cancer_data.csv")
+proteomic_data <- read_csv("proteomic_data.csv")
+futimes <- read_csv("futimes.csv")
+baseline_data <- read_csv("baseline_chars.csv")
+```
+
+Create joined dataset
+```{r}
+data_wide <- futimes %>%
+  inner_join(cancer_data, by = "subjectid") %>%
+  inner_join(proteomic_data, by = "subjectid") %>%
+  inner_join(baseline_data, by = "subjectid") %>%
+  mutate(
+    cancer_futime = 2015 - v2date21_year, # followup time from visit 2 to 2015 (date of cancer status assessment)
+    # create new variables for mm, cll, bnhl (types of cancer)
+    mm = case_when(
+      mye_lym1 == "Lymphoid (MM)" ~ 1,
+      TRUE ~ 0), # in all other cases set equal to zero (justification: we have already filtered for !na lymphoid_inc, so cancer status is known)
+    cll = case_when(
+      mye_lym1 == "Lymphoid (CLL)" ~ 1,
+      TRUE ~ 0), # in all other cases set equal to zero (justification: we have already filtered for !na lymphoid_inc, so cancer status is known)
+    bnhl = case_when(
+      mye_lym1 == "Lymphoid (B-NHL)" ~ 1,
+      TRUE ~ 0) # in all other cases set equal to zero (justification: we have already filtered for !na lymphoid_inc, so cancer status is known)
+  )
+
+# first, calculate mean time intervals from visit 2 to visit 3
+mean_v2_v3_gap <- mean(data_wide$v3_from_v2, na.rm = TRUE)
+mean_v2_v5_gap <- mean(data_wide$v5_from_v2, na.rm = TRUE)
+
+data_wide <- data_wide %>%
+  rowwise() %>%
+  mutate(
+    event_from_v2 = case_when(
+      !is.na(lyminc_t_v2) ~ lyminc_t_v2,
+      !is.na(lyminc_t_v3) ~ lyminc_t_v3 + mean_v2_v3_gap,
+      !is.na(lyminc_t_v5) ~ lyminc_t_v5 + mean_v2_v5_gap
+    ),
+    event_from_v3 = event_from_v2 - v3_from_v2,
+    event_from_v5 = event_from_v2 - v5_from_v2
+  ) %>%
+  filter(event_from_v2 > 0) # only keep those with event time > 0 (ie diagnosed after visit 2)
+
+```
+
+
+
+Pivot longer
+```{r}
+data_long <- data_wide %>%
+  pivot_longer(
+    cols = matches("^v[235]_SeqId_\\d+_\\d+$"),
+    names_to = c("visit", "protein"),
+    names_pattern = "^v(\\d)_(SeqId_\\d+_\\d+)$",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = protein,
+    values_from = value
+  )
+```
+
+
+Add event_from_visit variable
+```{r}
+data_long_visittimes <- data_long %>%
+  mutate(visit_time = case_when(
+    visit == "2" ~ 0,
+    visit == "3" ~ v3_from_v2,
+    visit == "5" ~ v5_from_v2
+  )) %>%
+  group_by(subjectid) %>%
+  arrange(visit_time) %>%
+  mutate(event_from_visit = event_from_v2 - visit_time) %>% # calculate time from current visit to event/censoring
+  ungroup()
+```
+
+
+Create event flag (set to 1 at the row where event occurs, 0 otherwise)
+
+Delete proteomic measurements after event time
+```{r}
+data_long_filtered <- data_long_visittimes %>%
+  filter(event_from_visit > 0) # remove rows (proteomic data) after cancer diagnosis 
+```
+
+
+
+## Create protein velocity variable 
+
+```{r}
+all_proteins_outcomes <- data_long_filtered %>%
+  select(subjectid, bmi01, v1age01, center, gender, lymphoid_inc, mm, cll, bnhl, visit, visit_time, event_from_v2, SeqId_2665_26, SeqId_16322_10, SeqId_3292_75, SeqId_7849_3, SeqId_2704_74, SeqId_3291_30, SeqId_6574_11, SeqId_16915_153, SeqId_3291_30, SeqId_3487_32, SeqId_17346_61, SeqId_7266_4)  
+
+
+```
+
+Create lagged variables, calculate protein velocity (PV) and protein value at most recent visit (PR)
+
+Function to prepare tdc data
+```{r}
+prepare_tdc_data <- function(df, protein_col, event_col) {
+  df %>%
+    arrange(subjectid, visit) %>%
+    group_by(subjectid) %>%
+    mutate(
+      # Create lagged variables for protein value and time
+      protein_prev = lag(.data[[protein_col]], n = 1),
+      time_prev = lag(visit_time, n = 1),
+      
+      # Protein velocity (PV)
+      PV_calc = (.data[[protein_col]] - protein_prev) / (visit_time - time_prev),
+      PV = case_when(is.na(PV_calc) ~ 0, TRUE ~ PV_calc),
+      
+      # Protein values
+      PR = .data[[protein_col]],
+      PB = first(.data[[protein_col]]),
+      
+      # Binary event indicator (per row)
+      event_ind = ifelse(.data[[event_col]] == 1, 1, 0)
+    ) %>%
+    ungroup() %>%
+    
+    # survival formatting
+    group_by(subjectid) %>%
+    arrange(subjectid, visit_time) %>%
+    mutate(
+      tstart = visit_time, # define start time of interval as current visit time (e.g. v2 = 0, v3 = 3, v5 = 20)
+      tstop = lead(visit_time, default = unique(event_from_v2)),  # usually set the stop time to the next visit (lead(visit_time). but if it's the last visit (ie before censoring/event) then it's the event_time
+      
+      # event indicator -- event = 1 if tstop is the event time and the event occurred, 0 otherwise
+      event = ifelse(tstop == unique(event_from_v2) & event_ind == 1, 1, 0)
+      )  %>%
+    ungroup()
+  
+}
+
+```
+
+Test out 
+```{r}
+# select protein of interest (SeqId_2665_26) and relevant covariates 
+protein_of_interest <- "SeqId_2665_26"
+# select event of interest (lymphoid_inc, mm, cll, bnhl)
+event_of_interest <- "lymphoid_inc"
+
+data_tdc <- prepare_tdc_data(all_proteins_outcomes, protein_of_interest, event_of_interest)
+```
+
+Fit the cox model 
+
+1. Just on baseline protein
+```{r}
+cox_model_baseline <- coxph(Surv(tstart, tstop, event) ~ PB + bmi01 + v1age01 + gender + center, data = data_tdc)
+summary(cox_model_baseline) 
+```
+
+2. Model from recent protein and velocity 
+```{r}
+cox_model_recent <- coxph(Surv(tstart, tstop, event) ~ PV + PR + bmi01 + v1age01 + gender + center, data = data_tdc)
+summary(cox_model_recent) 
+```
+
+
+```{r}
+# function to fit tdc models
+fit_tdc_models <- function(protein_col, outcome_col) {
+  # prepare data 
+  tdc_data <- prepare_tdc_data(all_proteins_outcomes, protein_col, outcome_col)
+  
+  # fit cox model for baseline 
+  cox_model_baseline <- coxph(Surv(tstart, tstop, event) ~ PB + bmi01 + v1age01 + gender + center, data = tdc_data)
+  
+  # fit cox model for recent protein 
+  cox_model_recent <- coxph(Surv(tstart, tstop, event) ~ PV + PR + bmi01 + v1age01 + gender + center, data = tdc_data) 
+  
+  # return tidy results for each model
+  bind_rows(
+    tidy(cox_model_baseline) %>% 
+      mutate(model = "baseline"),
+    tidy(cox_model_recent) %>%
+      mutate(model = "recent")
+  ) %>%
+    mutate(protein = protein_col, outcome = outcome_col)
+}
+```
+
+
+## Automate over protein-outcome combinations of interest
+Loop over all protein-outcome combinations
+```{r}
+df_protein_mapping <- tibble::tibble(
+  protein_seqid = c("SeqId_2665_26", "SeqId_16322_10", "SeqId_3292_75", "SeqId_7849_3", "SeqId_2704_74", "SeqId_3291_30", "SeqId_6574_11", "SeqId_16915_153", "SeqId_3291_30", "SeqId_3487_32", "SeqId_17346_61", "SeqId_7266_4"),
+  outcome = c("mm", "mm", "mm", "mm", "mm", "cll", "cll", "cll", "bnhl", "bnhl", "bnhl", "bnhl")
+)
+
+# run both models for each mapping 
+results_singleprotein_alloutcomes <- df_protein_mapping %>%
+  pmap_dfr(~fit_tdc_models(..1, ..2))  # ..1 = protein_col, ..2 = outcome
+```
+
+```{r}
+# create summary table 
+single_proteins_summary <- results_singleprotein_alloutcomes %>%
+  filter(term %in% c("PB", "PR", "PV")) %>%
+  select(protein, outcome, model, term,estimate, p.value) %>%
+  pivot_wider(names_from = c(model, term), values_from = c(estimate, p.value))
+
+single_proteins_summary
+```
+
+
+Save summary table 
+```{r}
+write_csv(single_proteins_summary, "tdc_singleprotein_summary.csv")
+```
+
+
+
+## Lagged model 
+
+Purpose: only use protein values measured at least X time before the event occurred -- so shift availability of protein measurements forward by 0.5 years
+- requires protein to predict cancer at least 6 months ahead - reduces likelihood of reverse causation
+- ie we are essentially dropping protein observations where people got cancer right after 
+```{r}
+prepare_lagged_tdc_data <- function(df, protein_col, event_col, lag_time = 0.5) {
+  
+  df %>%
+    arrange(subjectid, visit) %>%
+    group_by(subjectid) %>%
+    mutate(
+      # Create lagged variables for protein value and time
+      protein_prev = lag(.data[[protein_col]], n = 1),
+      time_prev = lag(visit_time, n = 1),
+      
+      # Protein velocity (PV)
+      PV_calc = (.data[[protein_col]] - protein_prev) / (visit_time - time_prev),
+      PV = case_when(is.na(PV_calc) ~ 0, TRUE ~ PV_calc),
+      
+      # Protein values
+      PR = .data[[protein_col]],
+      PB = first(.data[[protein_col]]),
+      
+      # Binary event indicator (per row)
+      event_ind = ifelse(.data[[event_col]] == 1, 1, 0)
+    ) %>%
+    ungroup() %>%
+    
+    
+    filter(event_from_v2 > lag_time) %>% # remove people who had the event before the lag time
+    
+    mutate(visit_time_lagged = visit_time + lag_time) %>% # apply lag to visit times
+    
+    
+    # survival formatting
+    group_by(subjectid) %>%
+    arrange(subjectid, visit_time_lagged) %>%
+    mutate(
+      tstart = visit_time_lagged, # define start time of interval as current visit time (e.g. v2 = 0, v3 = 3, v5 = 20)
+      tstop = lead(visit_time_lagged, default = unique(event_from_v2)),  # usually set the stop time to the next visit (lead(visit_time). but if it's the last visit (ie before censoring/event) then it's the event_time
+      
+      # event indicator -- event = 1 if tstop is the event time and the event occurred, 0 otherwise
+      event = ifelse(tstop == unique(event_from_v2) & event_ind == 1, 1, 0)
+      )  %>%
+    ungroup() %>% 
+    filter(tstop > tstart)  # remove intervals where tstop <= tstart (can happen due to lagging)
+  
+}
+
+# fit lagged tdc models
+
+fit_lagged_tdc_models <- function(protein_col, outcome_col) {
+  # prepare data 
+  tdc_data <- prepare_lagged_tdc_data(all_proteins_outcomes, protein_col, outcome_col)
+  
+  # fit cox model for baseline 
+  cox_model_baseline <- coxph(Surv(tstart, tstop, event) ~ PB + bmi01 + v1age01 + gender + center, data = tdc_data)
+  
+  # fit cox model for recent protein 
+  cox_model_recent <- coxph(Surv(tstart, tstop, event) ~ PV + PR + bmi01 + v1age01 + gender + center, data = tdc_data) 
+  
+  # return tidy results for each model
+  bind_rows(
+    tidy(cox_model_baseline) %>% 
+      mutate(model = "baseline (lagged)"),
+    tidy(cox_model_recent) %>%
+      mutate(model = "recent (lagged)")
+  ) %>%
+    mutate(protein = protein_col, outcome = outcome_col)
+}
+```
+
+Test out 
+```{r}
+fit_lagged_tdc_models("SeqId_2665_26", "mm")
+```
+
+Loop over all protein-outcome combinations
+```{r}
+results_singleprotein_alloutcomes_lagged <- df_protein_mapping %>%
+  pmap_dfr(~fit_lagged_tdc_models(..1, ..2))  # ..1 = protein_col, ..2 = outcome
+```
+
+```{r}
+# create summary table
+single_proteins_summary_lagged <- results_singleprotein_alloutcomes_lagged %>%
+  filter(term %in% c("PB", "PR", "PV")) %>%
+  select(protein, outcome, model, term,estimate, p.value) %>%
+  pivot_wider(names_from = c(model, term), values_from = c(estimate, p.value))
+
+single_proteins_summary_lagged
+```
+
+Write to csv
+```{r}
+write_csv(single_proteins_summary_lagged, "tdc_singleprotein_summary_lagged.csv")
+```
+
+
+## Model all proteins per disease together
+
+Modified functions:
+```{r}
+prepare_tdc_data_multiprot <- function(df, protein_cols, event_col) {
+  df <- df %>%
+    arrange(subjectid, visit)
+  
+  for (protein in protein_cols) {
+    df <- df %>%
+      group_by(subjectid) %>%
+      arrange(subjectid, visit_time) %>%
+      mutate(
+        protein_prev = lag(.data[[protein]], n = 1),
+        time_prev = lag(visit_time, n = 1),
+        PV_calc = (.data[[protein]] - protein_prev) / (visit_time - time_prev),
+        !!paste0("PV_", protein) := case_when(is.na(PV_calc) ~ 0, TRUE ~ PV_calc),
+        !!paste0("PR_", protein) := .data[[protein]],
+        !!paste0("PB_", protein) := first(.data[[protein]])
+      ) %>%
+      ungroup() %>%
+      select(-protein_prev, -time_prev, -PV_calc)
+  }
+  
+  df <- df %>%
+    group_by(subjectid) %>%
+    arrange(subjectid, visit_time) %>%
+    mutate(
+      event_ind = ifelse(.data[[event_col]] == 1, 1, 0),
+      tstart = visit_time,
+      tstop = lead(visit_time, default = unique(event_from_v2)),
+      event = ifelse(tstop == unique(event_from_v2) & event_ind == 1, 1, 0)
+    ) %>%
+    ungroup()
+  
+  return(df)
+}
+```
+
+```{r} 
+fit_tdc_models_multiprot <- function(protein_cols, outcome_col) {
+  # Prepare data
+  tdc_data <- prepare_tdc_data_multiprot(all_proteins_outcomes, protein_cols, outcome_col)
+  
+  # Construct formula components
+  pb_terms <- paste0("PB_", protein_cols)
+  pr_terms <- paste0("PR_", protein_cols)
+  pv_terms <- paste0("PV_", protein_cols)
+  
+  # Baseline model formula (PBs)
+  formula_baseline <- as.formula(
+    paste("Surv(tstart, tstop, event) ~",
+          paste(c(pb_terms, "bmi01", "v1age01", "gender", "center"), collapse = " + "))
+  )
+  
+  # Recent model formula (PRs and PVs)
+  formula_recent <- as.formula(
+    paste("Surv(tstart, tstop, event) ~",
+          paste(c(pr_terms, pv_terms, "bmi01", "v1age01", "gender", "center"), collapse = " + "))
+  )
+  
+  # Fit models
+  cox_model_baseline <- coxph(formula_baseline, data = tdc_data)
+  cox_model_recent   <- coxph(formula_recent, data = tdc_data)
+  
+  # Return tidy output
+  bind_rows(
+    tidy(cox_model_baseline) %>% mutate(model = "baseline"),
+    tidy(cox_model_recent) %>% mutate(model = "recent")
+  ) %>%
+    mutate(proteins = paste(protein_cols, collapse = ", "),
+           outcome = outcome_col)
+}
+```
+
+
+```{r}
+results_mm_allproteins <- fit_tdc_models_multiprot(
+  protein_cols = c("SeqId_2665_26", "SeqId_16322_10", "SeqId_3292_75", "SeqId_7849_3", "SeqId_2704_74"),
+  outcome_col = "mm"
+)
+```
+
+```{r}
+results_cll_allproteins <- fit_tdc_models_multiprot(
+  protein_cols = c("SeqId_3291_30", "SeqId_6574_11", "SeqId_16915_153"),
+  outcome_col = "cll"
+)
+```
+
+```{r}
+results_bnhl_allproteins <- fit_tdc_models_multiprot(
+  protein_cols = c("SeqId_3291_30", "SeqId_3487_32", "SeqId_17346_61", "SeqId_7266_4"),
+  outcome_col = "bnhl"
+)
+```
+
+
+
+Function to create summary table
+```{r}
+summarise_tdc_results_multiprot <- function(results_df) {
+  results_df %>%
+    # 1. Keep only PB, PR, PV terms
+    filter(str_starts(term, "PB_") | str_starts(term, "PR_") | str_starts(term, "PV_")) %>%
+    
+    # 2. Extract protein and type
+    mutate(
+      term_type = str_extract(term, "^PB_|^PR_|^PV_"),
+      protein = str_remove(term, "^PB_|^PR_|^PV_"),
+      model_term = paste0(term_type, "_", model)  # e.g., PB_baseline, PR_recent
+    ) %>%
+    
+    # 3. Reshape
+    select(outcome, protein, model_term, estimate, p.value) %>%
+    pivot_wider(
+      names_from = model_term,
+      values_from = c(estimate, p.value),
+      names_sep = "_"
+    ) %>%
+    
+    # 4. Clean column names
+    rename_with(~ str_replace_all(., c("estimate_" = "", "p.value_" = "p_")))
+}
+
+```
+
+Test out 
+```{r}
+mm_multiprot_summary <- summarise_tdc_results_multiprot(results_mm_allproteins)
+cll_multiprot_summary <- summarise_tdc_results_multiprot(results_cll_allproteins)
+bnhl_multiprot_summary <- summarise_tdc_results_multiprot(results_bnhl_allproteins)
+```
+
+Create final summary table
+```{r}
+final_summary_table <- bind_rows(mm_multiprot_summary, cll_multiprot_summary, bnhl_multiprot_summary)
+final_summary_table
+write_csv(final_summary_table, "tdc_combinedproteinmodel_summary.csv")
+```
+
+

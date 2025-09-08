@@ -163,9 +163,17 @@ Test out
 # select protein of interest (SeqId_2665_26) and relevant covariates 
 protein_of_interest <- "SeqId_2665_26"
 # select event of interest (lymphoid_inc, mm, cll, bnhl)
-event_of_interest <- "lymphoid_inc"
+event_of_interest <- "mm"
 
 data_tdc <- prepare_tdc_data(all_proteins_outcomes, protein_of_interest, event_of_interest)
+```
+
+Explore 
+```{r}
+# within tdc, what is the mean PV among mm cases vs non-cases?
+data_tdc %>%
+  group_by(event) %>%
+  summarise(mean_PV = mean(PV, na.rm = TRUE), sd_PV = sd(PV, na.rm = TRUE), n = n())
 ```
 
 Fit the cox model 
@@ -179,9 +187,98 @@ summary(cox_model_baseline)
 2. Model from recent protein and velocity 
 ```{r}
 cox_model_recent <- coxph(Surv(tstart, tstop, event) ~ PV + PR + bmi01 + v1age01 + gender + center, data = data_tdc)
-summary(cox_model_recent) 
+summary_recentandvelocity <- summary(cox_model_recent) 
 ```
 
+Model with only recent
+```{r}
+cox_model_recentonly  <- coxph(Surv(tstart, tstop, event) ~ PR + bmi01 + v1age01 + gender + center, data = data_tdc)
+summary_recentonly <- summary(cox_model_recentonly) 
+```
+Model with only velocity 
+```{r}
+cox_model_velocity <- coxph(Surv(tstart, tstop, event) ~ PV + bmi01 + v1age01 + gender + center, data = data_tdc)
+summary_velocityonly <- summary(cox_model_velocity) 
+```
+
+```{r}
+# write to csv the three summaries
+bind_rows(
+  tidy(cox_model_baseline) %>% mutate(model = "baseline"),
+  tidy(cox_model_recent) %>% mutate(model = "recent + velocity"),
+  tidy(cox_model_recentonly) %>% mutate(model = "recent only"),
+  tidy(cox_model_velocity) %>% mutate(model = "velocity only")
+) %>%
+  write_csv("tdc_model_summaries_example.csv")
+```
+
+Diagnostics -- Inspect data_tdc 
+```{r}
+cor(data_tdc$PR, data_tdc$PV, use = "complete.obs")
+plot(data_tdc$PR, data_tdc$PV); abline(lm(data_tdc$PV ~ data_tdc$PR))
+
+library(car)
+fit_lm <- lm(PV ~ PR + bmi01 + v1age01 + gender, data = data_tdc)
+vif(fit_lm)
+
+res <- lm(PV ~ PR, data = data_tdc, na.action = na.exclude)
+data_tdc$PV_res <- residuals(res)
+
+# fit cox with residualized PV
+cox_model_PVres <- coxph(Surv(tstart, tstop, event) ~ PV_res + PR + bmi01 + v1age01 + gender + center, data = data_tdc)
+summary(cox_model_PVres) 
+
+# report how many rows have PV > 0
+sum(data_tdc$PV > 0, na.rm = TRUE)
+sum(data_tdc$PV == 0, na.rm = TRUE)
+hist(data_tdc$PV, breaks = 50)
+```
+ 
+### Example 2 : Protein SeqId_16322_10 and mm
+Prepare tdc data
+```{r}
+data_tdc_2 <- prepare_tdc_data(all_proteins_outcomes, "SeqId_16322_10", "mm")
+
+model_recentonly <- coxph(Surv(tstart, tstop, event) ~  PR + bmi01 + v1age01 + gender + center, data = data_tdc_2)
+summary(model_recentonly) 
+
+model_velocityonly <- coxph(Surv(tstart, tstop, event) ~ PV + bmi01 + v1age01 + gender + center, data = data_tdc_2)
+summary(model_velocityonly) 
+
+model_recentandvelocity  <- coxph(Surv(tstart, tstop, event) ~ PR + PV + bmi01 + v1age01 + gender + center, data = data_tdc_2)
+summary(model_recentandvelocity)
+
+
+```
+
+```{r}
+# write to csv the three summaries
+bind_rows(
+  tidy(model_recentonly) %>% mutate(model = "recent only"),
+  tidy(model_velocityonly) %>% mutate(model = "velocity only"),
+  tidy(model_recentandvelocity) %>% mutate(model = "recent and velocity")
+) %>%
+  write_csv("tdc_models_16322_mm.csv")
+```
+
+Diagnostics -- Inspect data_tdc_2
+```{r}
+cor(data_tdc_2$PR, data_tdc_2$PV, use = "complete.obs")
+plot(data_tdc_2$PR, data_tdc_2$PV); abline(lm(data_tdc_2$PV ~ data_tdc_2$PR))
+
+library(car)
+fit_lm <- lm(PV ~ PR + bmi01 + v1age01 + gender, data = data_tdc_2)
+vif(fit_lm)
+
+res <- lm(PV ~ PR, data = data_tdc_2, na.action = na.exclude)
+data_tdc_2$PV_res <- residuals(res)
+
+# fit cox with residualized PV
+cox_model_PVres <- coxph(Surv(tstart, tstop, event) ~ PV_res + PR + bmi01 + v1age01 + gender + center, data = data_tdc_2)
+summary(cox_model_PVres) 
+```
+
+## Function to fit tdc models 
 
 ```{r}
 # function to fit tdc models
@@ -216,8 +313,8 @@ df_protein_mapping <- tibble::tibble(
 )
 
 # run both models for each mapping 
-results_singleprotein_alloutcomes <- df_protein_mapping %>%
-  pmap_dfr(~fit_tdc_models(..1, ..2))  # ..1 = protein_col, ..2 = outcome
+# results_singleprotein_alloutcomes <- df_protein_mapping %>%
+#  pmap_dfr(~fit_tdc_models(..1, ..2))  # ..1 = protein_col, ..2 = outcome
 ```
 
 ```{r}
@@ -237,6 +334,55 @@ write_csv(single_proteins_summary, "tdc_singleprotein_summary.csv")
 ```
 
 
+**Fit tdc models only for velocity**
+```{r}
+fit_tdc_models_velocity <- function(protein_col, outcome_col) {
+  # prepare data 
+  tdc_data <- prepare_tdc_data(all_proteins_outcomes, protein_col, outcome_col)
+  
+  # fit cox model for recent only 
+  cox_model_recentonly <- coxph(Surv(tstart, tstop, event) ~ PR + bmi01 + v1age01 + gender + center, data = tdc_data)
+  
+  # fit cox model for velocity only 
+  cox_model_velocityonly <- coxph(Surv(tstart, tstop, event) ~ PV + bmi01 + v1age01 + gender + center, data = tdc_data)
+  
+  # fit cox model for velocity and recent
+  cox_model_recentvelocity <- coxph(Surv(tstart, tstop, event) ~ PV + PR + bmi01 + v1age01 + gender + center, data = tdc_data) 
+  
+  # return tidy results for each model
+  bind_rows(
+    tidy(cox_model_velocityonly) %>% 
+      mutate(model = "velocity_only"),
+    tidy(cox_model_recentvelocity) %>%
+      mutate(model = "recent_velocity"),
+    tidy(cox_model_recentonly) %>%
+      mutate(model = "recent_only")
+  ) %>%
+    mutate(protein = protein_col, outcome = outcome_col)
+}
+
+## Automate over protein-outcome combinations of interest
+df_protein_mapping <- tibble::tibble(
+  protein_seqid = c("SeqId_2665_26", "SeqId_16322_10", "SeqId_3292_75", "SeqId_7849_3", "SeqId_2704_74", "SeqId_3291_30", "SeqId_6574_11", "SeqId_16915_153", "SeqId_3291_30", "SeqId_3487_32", "SeqId_17346_61", "SeqId_7266_4"),
+  outcome = c("mm", "mm", "mm", "mm", "mm", "cll", "cll", "cll", "bnhl", "bnhl", "bnhl", "bnhl")
+)
+
+# run both models for each mapping 
+#results_singleprotein_alloutcomes_velocity <- df_protein_mapping %>%
+#  pmap_dfr(~fit_tdc_models_velocity(..1, ..2))  # ..1 = protein_col, ..2 = outcome
+```
+
+```{r}
+# create summary table 
+single_proteins_summary_velocity <- results_singleprotein_alloutcomes_velocity %>%
+  filter(term %in% c("PB", "PR", "PV")) %>%
+  select(protein, outcome, model, term, estimate, std.error, p.value) %>%
+  pivot_wider(names_from = c(model, term), values_from = c(estimate, std.error, p.value))
+
+single_proteins_summary_velocity
+
+write_csv(single_proteins_summary_velocity, "tdc_velocitycomparison_singleprotein.csv")
+```
 
 ## Lagged model 
 
@@ -318,8 +464,8 @@ fit_lagged_tdc_models("SeqId_2665_26", "mm")
 
 Loop over all protein-outcome combinations
 ```{r}
-results_singleprotein_alloutcomes_lagged <- df_protein_mapping %>%
-  pmap_dfr(~fit_lagged_tdc_models(..1, ..2))  # ..1 = protein_col, ..2 = outcome
+# results_singleprotein_alloutcomes_lagged <- df_protein_mapping %>%
+#  pmap_dfr(~fit_lagged_tdc_models(..1, ..2))  # ..1 = protein_col, ..2 = outcome
 ```
 
 ```{r}

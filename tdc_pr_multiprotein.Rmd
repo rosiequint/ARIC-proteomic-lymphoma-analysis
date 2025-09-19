@@ -1,0 +1,272 @@
+---
+title: "TDC protein velocity"
+output: html_document
+date: "2025-08-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load necessary libraries 
+```{r}
+library(tidyverse)
+library(survival)
+library(broom)
+```
+
+
+Prep the data 
+```{r}
+# load cancer, protein, and followup time data
+cancer_data <- read_csv("cancer_data.csv")
+proteomic_data <- read_csv("proteomic_data.csv")
+futimes <- read_csv("futimes.csv")
+baseline_data <- read_csv("baseline_chars.csv")
+```
+
+Create joined dataset
+```{r}
+data_wide <- futimes %>%
+  inner_join(cancer_data, by = "subjectid") %>%
+  inner_join(proteomic_data, by = "subjectid") %>%
+  inner_join(baseline_data, by = "subjectid") %>%
+  mutate(
+    cancer_futime = 2015 - v2date21_year, # followup time from visit 2 to 2015 (date of cancer status assessment)
+    # create new variables for mm, cll, bnhl (types of cancer)
+    mm = case_when(
+      mye_lym1 == "Lymphoid (MM)" ~ 1,
+      TRUE ~ 0), # in all other cases set equal to zero (justification: we have already filtered for !na lymphoid_inc, so cancer status is known)
+    cll = case_when(
+      mye_lym1 == "Lymphoid (CLL)" ~ 1,
+      TRUE ~ 0), # in all other cases set equal to zero (justification: we have already filtered for !na lymphoid_inc, so cancer status is known)
+    bnhl = case_when(
+      mye_lym1 == "Lymphoid (B-NHL)" ~ 1,
+      TRUE ~ 0) # in all other cases set equal to zero (justification: we have already filtered for !na lymphoid_inc, so cancer status is known)
+  )
+
+# first, calculate mean time intervals from visit 2 to visit 3
+mean_v2_v3_gap <- mean(data_wide$v3_from_v2, na.rm = TRUE)
+mean_v2_v5_gap <- mean(data_wide$v5_from_v2, na.rm = TRUE)
+
+data_wide <- data_wide %>%
+  rowwise() %>%
+  mutate(
+    event_from_v2 = case_when(
+      !is.na(lyminc_t_v2) ~ lyminc_t_v2,
+      !is.na(lyminc_t_v3) ~ lyminc_t_v3 + mean_v2_v3_gap,
+      !is.na(lyminc_t_v5) ~ lyminc_t_v5 + mean_v2_v5_gap
+    ),
+    event_from_v3 = event_from_v2 - v3_from_v2,
+    event_from_v5 = event_from_v2 - v5_from_v2
+  ) %>%
+  filter(event_from_v2 > 0) # only keep those with event time > 0 (ie diagnosed after visit 2)
+
+```
+
+
+
+Pivot longer
+```{r}
+data_long <- data_wide %>%
+  pivot_longer(
+    cols = matches("^v[235]_SeqId_\\d+_\\d+$"),
+    names_to = c("visit", "protein"),
+    names_pattern = "^v(\\d)_(SeqId_\\d+_\\d+)$",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = protein,
+    values_from = value
+  )
+```
+
+
+Add event_from_visit variable
+```{r}
+data_long_visittimes <- data_long %>%
+  mutate(visit_time = case_when(
+    visit == "2" ~ 0,
+    visit == "3" ~ v3_from_v2,
+    visit == "5" ~ v5_from_v2
+  )) %>%
+  group_by(subjectid) %>%
+  arrange(visit_time) %>%
+  mutate(event_from_visit = event_from_v2 - visit_time) %>% # calculate time from current visit to event/censoring
+  ungroup()
+```
+
+
+Create event flag (set to 1 at the row where event occurs, 0 otherwise)
+
+Delete proteomic measurements after event time
+```{r}
+data_long_filtered <- data_long_visittimes %>%
+  filter(event_from_visit > 0) # remove rows (proteomic data) after cancer diagnosis 
+```
+
+```{r}
+all_proteins_outcomes <- data_long_filtered %>%
+  select(subjectid, bmi01, v1age01, center, gender, lymphoid_inc, mm, cll, bnhl, visit, visit_time, event_from_v2, SeqId_2665_26, SeqId_16322_10, SeqId_3292_75, SeqId_7849_3, SeqId_2704_74, SeqId_3291_30, SeqId_6574_11, SeqId_16915_153, SeqId_3291_30, SeqId_3487_32, SeqId_17346_61, SeqId_7266_4) %>% 
+  filter(if_any(starts_with("SeqId"), ~!is.na(.)))  
+
+
+```
+
+
+## Model all proteins per disease together
+
+Modified functions:
+```{r}
+prepare_tdc_data_multiprot <- function(df, protein_cols, event_col) {
+  df <- df %>%
+    arrange(subjectid, visit)
+  
+  for (protein in protein_cols) {
+    df <- df %>%
+      group_by(subjectid) %>%
+      arrange(subjectid, visit_time) %>%
+      mutate(
+        protein_prev = lag(.data[[protein]], n = 1),
+        time_prev = lag(visit_time, n = 1),
+        PV_calc = (.data[[protein]] - protein_prev) / (visit_time - time_prev),
+        !!paste0("PV_", protein) := case_when(is.na(PV_calc) ~ 0, TRUE ~ PV_calc),
+        !!paste0("PB_", protein) := first(.data[[protein]])
+      ) %>%
+      ungroup() %>%
+      select(-protein_prev, -time_prev, -PV_calc)
+  }
+  
+  df <- df %>%
+    group_by(subjectid) %>%
+    arrange(subjectid, visit_time) %>%
+    mutate(
+      event_ind = ifelse(.data[[event_col]] == 1, 1, 0),
+      tstart = visit_time,
+      tstop = lead(visit_time, default = unique(event_from_v2)),
+      event = ifelse(tstop == unique(event_from_v2) & event_ind == 1, 1, 0)
+    ) %>%
+    ungroup()
+  
+  return(df)
+}
+```
+
+```{r} 
+fit_tdc_models_multiprot <- function(protein_cols, outcome_col) {
+  # Prepare data
+  tdc_data <- prepare_tdc_data_multiprot(all_proteins_outcomes, protein_cols, outcome_col)
+  
+  # Construct formula components
+  pb_terms <- paste0("PB_", protein_cols)
+  pv_terms <- paste0("PV_", protein_cols)
+  
+  # Baseline model formula (PBs)
+  formula_baseline <- as.formula(
+    paste("Surv(tstart, tstop, event) ~",
+          paste(c(pb_terms, "bmi01", "v1age01", "gender", "center"), collapse = " + "))
+  )
+  
+  # Recent model formula (PRs and PVs)
+  formula_baselinevelocity <- as.formula(
+    paste("Surv(tstart, tstop, event) ~",
+          paste(c(pb_terms, pv_terms, "bmi01", "v1age01", "gender", "center"), collapse = " + "))
+  )
+  
+  # Fit models
+  cox_model_baseline <- coxph(formula_baseline, data = tdc_data)
+  cox_model_baselinevelocity   <- coxph(formula_baselinevelocity, data = tdc_data)
+  
+  # Return tidy output
+  bind_rows(
+    tidy(cox_model_baseline) %>% mutate(model = "baseline"),
+    tidy(cox_model_baselinevelocity) %>% mutate(model = "baseline+velocity")
+  ) %>%
+    mutate(proteins = paste(protein_cols, collapse = ", "),
+           outcome = outcome_col)
+}
+```
+
+
+```{r}
+results_mm_allproteins <- fit_tdc_models_multiprot(
+  protein_cols = c("SeqId_2665_26", "SeqId_16322_10", "SeqId_3292_75", "SeqId_7849_3", "SeqId_2704_74"),
+  outcome_col = "mm"
+)
+```
+
+```{r}
+results_cll_allproteins <- fit_tdc_models_multiprot(
+  protein_cols = c("SeqId_3291_30", "SeqId_6574_11", "SeqId_16915_153"),
+  outcome_col = "cll"
+)
+```
+
+```{r}
+results_bnhl_allproteins <- fit_tdc_models_multiprot(
+  protein_cols = c("SeqId_3291_30", "SeqId_3487_32", "SeqId_17346_61", "SeqId_7266_4"),
+  outcome_col = "bnhl"
+)
+```
+
+
+
+Function to create summary table
+```{r}
+summarise_tdc_results_multiprot <- function(results_df) {
+  results_df %>%
+    # 1. Keep only PB, PV terms
+    filter(str_starts(term, "PB_") | str_starts(term, "PV_")) %>%
+    
+    # 2. Extract protein and type
+    mutate(
+      term = str_extract(term, "^PB|^PV"),
+      protein = str_remove(term, "^PB_|^PV_")
+    ) %>%
+    
+    # 3. Reshape
+    select(outcome, protein, model, term, estimate, std.error, p.value) %>%
+    
+    # 4. Compute HR, CI, significance
+    mutate(
+      HR = exp(estimate),
+      CI_lower = exp(estimate - 1.96 * std.error),
+      CI_upper = exp(estimate + 1.96 * std.error),
+      CI = paste0("[", round(CI_lower, 3), ", ", round(CI_upper, 3), "]"),
+      estimate = round(estimate, 3),       # log-HR
+      HR = round(HR, 3),                   # HR
+      std.error = round(std.error, 3),     # SE of log-HR
+      signif = case_when(                  # significance stars
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        p.value < 0.1   ~ ".",
+        TRUE            ~ ""
+      ),
+      p.value = ifelse(p.value < 0.001, 
+                       formatC(p.value, format = "e", digits = 2), 
+                       formatC(p.value, format = "f", digits = 3))
+    ) %>%
+    select(outcome, protein, model, term, estimate, std.error, HR, CI, p.value, signif)
+}
+
+```
+
+Create final summary table
+```{r}
+mm_multiprot_summary <- summarise_tdc_results_multiprot(results_mm_allproteins)
+cll_multiprot_summary <- summarise_tdc_results_multiprot(results_cll_allproteins)
+bnhl_multiprot_summary <- summarise_tdc_results_multiprot(results_bnhl_allproteins)
+final_summary_table <- bind_rows(mm_multiprot_summary,
+                                 cll_multiprot_summary,
+                                 bnhl_multiprot_summary)
+final_summary_table
+
+```
+
+
+```{r}
+write_csv(final_summary_table, "tdc_combinedproteinmodel_summary.csv")
+```
+
+

@@ -1,0 +1,279 @@
+---
+title: "TDC protein velocity"
+output: html_document
+date: "2025-08-28"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load necessary libraries 
+```{r}
+library(tidyverse)
+library(survival)
+library(broom)
+```
+
+
+Prep the data 
+```{r}
+# load cancer, protein, and followup time data
+cancer_data <- read_csv("cancer_data.csv")
+proteomic_data <- read_csv("proteomic_data.csv")
+futimes <- read_csv("futimes.csv")
+baseline_data <- read_csv("baseline_chars.csv")
+```
+
+Create joined dataset
+```{r}
+data_wide <- futimes %>%
+  inner_join(cancer_data, by = "subjectid") %>%
+  inner_join(proteomic_data, by = "subjectid") %>%
+  inner_join(baseline_data, by = "subjectid") %>%
+  mutate(
+    cancer_futime = 2015 - v2date21_year, # followup time from visit 2 to 2015 (date of cancer status assessment)
+    # create new variables for mm, cll, bnhl (types of cancer)
+    mm = case_when(
+      mye_lym1 == "Lymphoid (MM)" ~ 1,
+      TRUE ~ 0), # in all other cases set equal to zero (justification: we have already filtered for !na lymphoid_inc, so cancer status is known)
+    cll = case_when(
+      mye_lym1 == "Lymphoid (CLL)" ~ 1,
+      TRUE ~ 0), # in all other cases set equal to zero (justification: we have already filtered for !na lymphoid_inc, so cancer status is known)
+    bnhl = case_when(
+      mye_lym1 == "Lymphoid (B-NHL)" ~ 1,
+      TRUE ~ 0) # in all other cases set equal to zero (justification: we have already filtered for !na lymphoid_inc, so cancer status is known)
+  )
+
+# first, calculate mean time intervals from visit 2 to visit 3
+mean_v2_v3_gap <- mean(data_wide$v3_from_v2, na.rm = TRUE)
+mean_v2_v5_gap <- mean(data_wide$v5_from_v2, na.rm = TRUE)
+
+data_wide <- data_wide %>%
+  rowwise() %>%
+  mutate(
+    event_from_v2 = case_when(
+      !is.na(lyminc_t_v2) ~ lyminc_t_v2,
+      !is.na(lyminc_t_v3) ~ lyminc_t_v3 + mean_v2_v3_gap,
+      !is.na(lyminc_t_v5) ~ lyminc_t_v5 + mean_v2_v5_gap
+    ),
+    event_from_v3 = event_from_v2 - v3_from_v2,
+    event_from_v5 = event_from_v2 - v5_from_v2
+  ) %>%
+  filter(event_from_v2 > 0) # only keep those with event time > 0 (ie diagnosed after visit 2)
+
+```
+
+
+
+Pivot longer
+```{r}
+data_long <- data_wide %>%
+  pivot_longer(
+    cols = matches("^v[235]_SeqId_\\d+_\\d+$"),
+    names_to = c("visit", "protein"),
+    names_pattern = "^v(\\d)_(SeqId_\\d+_\\d+)$",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = protein,
+    values_from = value
+  )
+```
+
+
+Add event_from_visit variable
+```{r}
+data_long_visittimes <- data_long %>%
+  mutate(visit_time = case_when(
+    visit == "2" ~ 0,
+    visit == "3" ~ v3_from_v2,
+    visit == "5" ~ v5_from_v2
+  )) %>%
+  group_by(subjectid) %>%
+  arrange(visit_time) %>%
+  mutate(event_from_visit = event_from_v2 - visit_time) %>% # calculate time from current visit to event/censoring
+  ungroup()
+```
+
+
+Create event flag (set to 1 at the row where event occurs, 0 otherwise)
+
+Delete proteomic measurements after event time
+```{r}
+data_long_filtered <- data_long_visittimes %>%
+  filter(event_from_visit > 0) # remove rows (proteomic data) after cancer diagnosis 
+```
+
+
+
+## Create protein velocity variable 
+
+```{r}
+all_proteins_outcomes <- data_long_filtered %>%
+  select(subjectid, bmi01, v1age01, center, gender, lymphoid_inc, mm, cll, bnhl, visit, visit_time, event_from_v2, SeqId_2665_26, SeqId_16322_10, SeqId_3292_75, SeqId_7849_3, SeqId_2704_74, SeqId_3291_30, SeqId_6574_11, SeqId_16915_153, SeqId_3291_30, SeqId_3487_32, SeqId_17346_61, SeqId_7266_4) %>% 
+  filter(if_any(starts_with("SeqId"), ~!is.na(.)))
+
+
+```
+
+Create lagged variables, calculate protein velocity (PV) and protein value at most recent visit (PR)
+
+Function to prepare tdc data
+```{r}
+prepare_tdc_data <- function(df, protein_col, event_col) {
+  df %>%
+    arrange(subjectid, visit) %>%
+    group_by(subjectid) %>%
+    mutate(
+      # Create lagged variables for protein value and time
+      protein_prev = lag(.data[[protein_col]], n = 1),
+      time_prev = lag(visit_time, n = 1),
+      
+      # Protein velocity (PV)
+      PV_calc = (.data[[protein_col]] - protein_prev) / (visit_time - time_prev),
+      PV = case_when(is.na(PV_calc) ~ 0, TRUE ~ PV_calc),
+      
+      # Protein values
+      PR = .data[[protein_col]],
+      PB = first(.data[[protein_col]]),
+      PL = last(.data[[protein_col]]),
+      
+      # Binary event indicator (per row)
+      event_ind = ifelse(.data[[event_col]] == 1, 1, 0)
+    ) %>%
+    ungroup() %>%
+    
+    # survival formatting
+    group_by(subjectid) %>%
+    arrange(subjectid, visit_time) %>%
+    mutate(
+      tstart = visit_time, # define start time of interval as current visit time (e.g. v2 = 0, v3 = 3, v5 = 20)
+      tstop = lead(visit_time, default = unique(event_from_v2)),  # usually set the stop time to the next visit (lead(visit_time). but if it's the last visit (ie before censoring/event) then it's the event_time
+      
+      # event indicator -- event = 1 if tstop is the event time and the event occurred, 0 otherwise
+      event = ifelse(tstop == unique(event_from_v2) & event_ind == 1, 1, 0)
+      )  %>%
+    ungroup()
+  
+}
+
+```
+
+Test out 
+```{r}
+# select protein of interest (SeqId_2665_26) and relevant covariates 
+protein_of_interest <- "SeqId_2665_26"
+# select event of interest (lymphoid_inc, mm, cll, bnhl)
+event_of_interest <- "mm"
+
+data_tdc <- prepare_tdc_data(all_proteins_outcomes, protein_of_interest, event_of_interest)
+data_tdc %>% count(visit)
+```
+
+Explore 
+```{r}
+# within tdc, what is the mean PV among mm cases vs non-cases?
+data_tdc %>%
+  group_by(event) %>%
+  summarise(mean_PV = mean(PV, na.rm = TRUE), sd_PV = sd(PV, na.rm = TRUE), n = n())
+```
+
+
+## Function to fit tdc models 
+
+```{r}
+# function to fit tdc models
+fit_tdc_models <- function(protein_col, outcome_col) {
+  # prepare data 
+  tdc_data <- prepare_tdc_data(all_proteins_outcomes, protein_col, outcome_col)
+  
+  # fit cox model for baseline 
+  cox_model_baseline <- coxph(Surv(tstart, tstop, event) ~ PB + bmi01 + v1age01 + gender + center, data = tdc_data)
+  
+  # fit cox model for baseline and velocity 
+  cox_model_baselinevelocity <- coxph(Surv(tstart, tstop, event) ~ PB + PV + bmi01+ v1age01 + gender + center, data = tdc_data)
+  
+  # return tidy results for each model
+  bind_rows(
+    tidy(cox_model_baseline) %>% 
+      mutate(model = "baseline"),
+    tidy(cox_model_baselinevelocity) %>%
+      mutate(model = "baseline-velocity")
+  ) %>%
+    mutate(protein = protein_col, outcome = outcome_col)
+}
+```
+
+Test
+```{r}
+test_model <- fit_tdc_models("SeqId_2665_26", "mm")
+```
+
+## Automate over protein-outcome combinations of interest
+Loop over all protein-outcome combinations
+```{r}
+df_protein_mapping <- tibble::tibble(
+  protein_seqid = c("SeqId_2665_26", "SeqId_16322_10", "SeqId_3292_75", "SeqId_7849_3", "SeqId_2704_74", "SeqId_3291_30", "SeqId_6574_11", "SeqId_16915_153", "SeqId_3291_30", "SeqId_3487_32", "SeqId_17346_61", "SeqId_7266_4"),
+  outcome = c("mm", "mm", "mm", "mm", "mm", "cll", "cll", "cll", "bnhl", "bnhl", "bnhl", "bnhl")
+)
+
+# run both models for each mapping 
+results_singleprotein_alloutcomes <- df_protein_mapping %>%
+  pmap_dfr(~fit_tdc_models(..1, ..2))  # ..1 = protein_col, ..2 = outcome
+```
+
+
+# create summary table 
+single_proteins_summary <- results_singleprotein_alloutcomes %>%
+  filter(term %in% c("PB", "PR", "PV", "PL")) %>%
+  select(protein, outcome, model, term,estimate, p.value, std.error) %>%
+  pivot_wider(names_from = c(model, term), values_from = c(estimate, p.value, std.error)) %>% 
+  mutate(
+    across(contains("estimate"), ~ round(.x, 3)),
+    across(contains("std.error"), ~ round(.x, 3)),
+    across(contains("p.value"), ~ ifelse(.x < 0.001, 
+                                         formatC(.x, format = "e", digits = 2), 
+                                         formatC(.x, format = "f", digits = 3)))
+  )
+
+single_proteins_summary
+
+
+```{r}
+allmodels_sp_summary <- results_singleprotein_alloutcomes %>%
+  filter(term %in% c("PB", "PR", "PV", "PL")) %>%
+  select(protein, outcome, model, term, estimate, p.value, std.error) %>%
+  mutate(
+    HR = exp(estimate), # exponentiated log-HR
+    CI_lower = exp(estimate - 1.96 * std.error),
+    CI_upper = exp(estimate + 1.96 * std.error),
+    CI = paste0("[", round(CI_lower, 3), ", ", round(CI_upper, 3), "]"),
+    estimate = round(estimate, 3),       # log-HR
+    HR = round(HR, 3),                   # HR
+    std.error = round(std.error, 3),     # SE of log-HR
+    signif = case_when(                  # significance stars
+      p.value < 0.001 ~ "***",
+      p.value < 0.01  ~ "**",
+      p.value < 0.05  ~ "*",
+      p.value < 0.1   ~ ".",
+      TRUE            ~ ""
+    ),
+    p.value = ifelse(p.value < 0.001, 
+                     formatC(p.value, format = "e", digits = 2), 
+                     formatC(p.value, format = "f", digits = 3))
+  ) %>%
+  select(-CI_lower, -CI_upper) 
+
+allmodels_sp_summary
+```
+
+
+Save summary table 
+
+write_csv(single_proteins_summary, "tdc_singleprotein_summary.csv")
+
+
+```{r}
+write_csv(allmodels_sp_summary, "tdc_allmodels_sp_summary.csv")
+```

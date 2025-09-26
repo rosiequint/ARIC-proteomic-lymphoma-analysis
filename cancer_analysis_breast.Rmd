@@ -1,0 +1,342 @@
+---
+title: "Cancer analysis -- breast"
+output: html_document
+date: "2025-09-18"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(haven)
+library(purrr)
+library(survival)
+library(broom)
+```
+
+```{r}
+# read in breast cancer data
+breast <- read_dta('breast_cancer_2015_np.dta') %>% 
+  rename(subjectid = id)  # rename id column to 'subjectid' for consistency 
+# read in baseline data and visit times
+baseline_data <- read_csv("baseline_chars.csv")
+futimes <- read_csv("futimes.csv")
+breast_covariates <- read_csv("breast_covariates.csv")
+v2_covariates_breast <- read_csv("v2_covariates.csv")
+
+breast_alldata <- baseline_data %>%
+  filter(gender == "F") %>%
+  select(-center) %>%
+  left_join(breast_covariates, by = "subjectid") %>%
+  left_join(v2_covariates_breast, by = "subjectid") %>% 
+  left_join(breast, by = "subjectid")
+```
+
+Filter breast dataset 
+```{r}
+breast_filtered <- breast_alldata %>%
+  filter(prvcancr == 0) %>% # exclude prevalent cancers at baseline
+  filter(racegrp == "W" | racegrp == "B") %>% # exclude non white/Black participants
+  filter(!is.na(incidence_t2)) %>% # exclude women with BC between visit 1 and visit 2, or visit 2 missing or prevalent cancer
+  filter(premenopause == 0 | postmeno_visit ==2) %>% # exclude women premenopausal or perimenopausal (ie not post-menopausal) at visit 2
+  filter(!(postmeno_visit %in% c(3, 4))) %>%
+  # exclude women who became postmenopausal at visit 3 or visit 4
+  filter(cause_menopause != "R" | cause_menopause != "U" | is.na(cause_menopause)) %>%  # exclude women if menopause due to radiation or unknown/missing cause (n = 21), women with implausible age at menarche (n = 3), or unknown drinking status at visit 2 (n = 1)
+  filter(relative_cancer != "U" | is.na(relative_cancer)) # exclude women with unknown family history of breast cancer
+```
+
+
+
+Example: breast cancer
+Extract proteomic data
+```{r}
+extract_protein_data <- function(seq_ids) {
+  
+  load_proteins <- function(visit, seq_ids) {
+    file_path <- paste0(
+      "/dcs04/legacy-dcs01-arking/ARIC_static/ARIC_Data/Proteomics/ARIC-SomaLogic_Nov2019/Data/soma_visit_",
+      visit,
+      "_log2_SMP",
+      ifelse(visit == 2, "_updated", ""),
+      ".txt"
+    )
+    
+    read.table(file_path, header = TRUE, sep = "\t") %>%
+      select(any_of(c("SampleId", seq_ids))) %>%
+      rename_with(~ paste0("v", visit, "_", .x), -SampleId) %>%
+      rename(subjectid = SampleId)
+  }
+  
+  v2 <- load_proteins(2, seq_ids)
+  v3 <- load_proteins(3, seq_ids)
+  v5 <- load_proteins(5, seq_ids)
+  
+  protein_allvis <- v2 %>%
+    full_join(v3, by = "subjectid") %>%
+    full_join(v5, by = "subjectid")
+  
+  return(protein_allvis)
+}
+
+# Example usage:
+breast_seq_ids <- c("SeqId_7154_92", "SeqId_6221_1")
+# seqid_7154_92 = LEG1 homolog
+# seqid_6221_1 = ADP-dependent glucokinase
+
+breast_protein_allvis <- extract_protein_data(breast_seq_ids)
+```
+
+Merge with proteomics data
+```{r}
+breast_data_wide <- breast_filtered %>%
+  inner_join(breast_protein_allvis, by = "subjectid") %>% # add proteomic data
+  inner_join(futimes, by = "subjectid") %>% # add visit timings
+  mutate(
+    cancer_futime = 2015 - v2date21_year, # followup time from visit 2 to 2015 (date of cancer status assessment)
+    case = incidence
+  )
+
+breast_data_wide <- breast_data_wide %>%
+  rowwise() %>%
+  mutate(
+    event_from_v2 = incidence_t2
+  ) %>%
+  filter(event_from_v2 > 0) # only keep those with event time > 0 (ie diagnosed after visit 2)
+
+# Pivot longer
+breast_data_long <- breast_data_wide %>%
+  pivot_longer(
+    cols = matches("^v[235]_SeqId_\\d+_\\d+$"),
+    names_to = c("visit", "protein"),
+    names_pattern = "^v(\\d)_(SeqId_\\d+_\\d+)$",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = protein,
+    values_from = value
+  )
+
+# Add event_from_visit variable
+breast_data_long_visittimes <- breast_data_long %>%
+  mutate(visit_time = case_when(
+    visit == "2" ~ 0,
+    visit == "3" ~ v3_from_v2,
+    visit == "5" ~ v5_from_v2
+  )) %>%
+  group_by(subjectid) %>%
+  arrange(visit_time) %>%
+  mutate(event_from_visit = event_from_v2 - visit_time) %>% # calculate time from current visit to event/censoring
+  ungroup()
+
+
+# Delete proteomic measurements after event time
+breast_data_long_filtered <- breast_data_long_visittimes %>%
+  filter(event_from_visit > 0) # remove rows (proteomic data) after cancer diagnosis 
+
+breast_selected_data <- breast_data_long_filtered %>%
+  filter(if_any(starts_with("SeqId"), ~!is.na(.)))
+```
+
+
+## TDC analysis 
+Prepare tdc data
+```{r}
+prepare_tdc_data <- function(df, protein_col, event_col) {
+  df %>%
+    arrange(subjectid, visit) %>%
+    group_by(subjectid) %>%
+    mutate(
+      # Create lagged variables for protein value and time
+      protein_prev = lag(.data[[protein_col]], n = 1),
+      time_prev = lag(visit_time, n = 1),
+      
+      # Protein velocity (PV)
+      PV_calc = (.data[[protein_col]] - protein_prev) / (visit_time - time_prev),
+      PV = case_when(is.na(PV_calc) ~ 0, TRUE ~ PV_calc),
+      
+      # Protein values
+      PB = first(.data[[protein_col]]), # baseline protein 
+      PL = last(.data[[protein_col]]), # last protein
+      PR = .data[[protein_col]], # recent protein
+      
+      # Binary event indicator (per row)
+      event_ind = ifelse(.data[[event_col]] == 1, 1, 0)
+    ) %>%
+    ungroup() %>%
+    
+    # survival formatting
+    group_by(subjectid) %>%
+    arrange(subjectid, visit_time) %>%
+    mutate(
+      tstart = visit_time, # define start time of interval as current visit time (e.g. v2 = 0, v3 = 3, v5 = 20)
+      tstop = lead(visit_time, default = unique(event_from_v2)),  # usually set the stop time to the next visit (lead(visit_time). but if it's the last visit (ie before censoring/event) then it's the event_time
+      
+      # event indicator -- event = 1 if tstop is the event time and the event occurred, 0 otherwise
+      event = ifelse(tstop == unique(event_from_v2) & event_ind == 1, 1, 0)
+      )  %>%
+    ungroup()
+  
+}
+
+```
+
+```{r}
+breast_tdc_7154 <- prepare_tdc_data(breast_selected_data, "SeqId_7154_92", "case")
+breast_tdc_6221 <- prepare_tdc_data(breast_selected_data, "SeqId_6221_1", "case")
+```
+
+```{r}
+# List of proteins you’re analyzing
+proteins <- c("SeqId_7154_92", "SeqId_6221_1")
+
+for (prot in proteins) {
+  cat("\n=== Protein:", prot, "===\n")
+  
+  # Prepare the data
+  tdc_data <- prepare_tdc_data(breast_selected_data, prot, "case")
+  
+  # Quick summaries
+  cat("Summary of PB (baseline protein):\n")
+  print(summary(tdc_data$PB))
+  
+  if("PV" %in% names(tdc_data)) {
+    cat("\nSummary of PV (protein velocity):\n")
+    print(summary(tdc_data$PV))
+    
+    # Optional: check correlation with event
+    cat("\nPV vs event table (binned):\n")
+    print(table(cut(tdc_data$PV, breaks = 5), tdc_data$event))
+  }
+  
+  # Check number of events per level of key covariates
+  cat("\nNumber of events per racegrp:\n")
+  print(table(tdc_data$racegrp, tdc_data$event))
+  
+  cat("\n---\n")
+}
+```
+
+```{r}
+library(corrplot) 
+
+# open a PDF device
+pdf("protein_correlation_matrices.pdf")
+
+# 7154
+protein_data_7154 <- breast_tdc_7154 %>%
+  select(PB, PR, PL, PV)
+cor_matrix_7154 <- cor(protein_data_7154, use = "pairwise.complete.obs")
+corrplot(cor_matrix_7154, title = "7154 Correlation Matrix")
+
+# 6221
+protein_data_6221 <- breast_tdc_6221 %>%
+  select(PB, PR, PL, PV)
+cor_matrix_6221 <- cor(protein_data_6221, use = "pairwise.complete.obs")
+corrplot(cor_matrix_6221, title = "6221 Correlation Matrix")
+
+# close the PDF device
+dev.off()
+```
+
+
+Function to fit tdc models 
+
+```{r}
+breast_selected_data_v2 <- breast_selected_data %>%
+  filter(visit == 2)
+summary(coxph(Surv(event_from_visit, case) ~ SeqId_7154_92 + racegrp + v1age01, data = breast_selected_data_v2))
+```
+```{r}
+# function to fit tdc models
+fit_tdc_models <- function(protein_col, outcome_col) {
+  # prepare data 
+  tdc_data <- prepare_tdc_data(breast_selected_data, protein_col, outcome_col)
+
+  # define adjustment variables 
+  base_vars <- "racegrp + v1age01"
+  adj_vars <- "center*racegrp + age_menarche + ever_hrt + ever_preg + age_first_preg + ever_birth + age_first_child + breastfed_months + v1_height + bmi01 + drnkr01 + diabts02"
+  
+  # define all models as a list
+  models <- list(
+    # baseline-only models 
+    "baseline-unadjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PB +", base_vars)), data = tdc_data),
+    "baseline-adjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PB +", base_vars, "+", adj_vars)), data = tdc_data),
+    
+    # baseline + velocity models
+    "baseline-velocity-unadjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PB + PV +", base_vars)), data = tdc_data),
+    "baseline-velocity-adjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PB + PV +", base_vars, "+", adj_vars)), data = tdc_data),
+    
+    # velocity only models 
+    "velocity-unadjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PV +", base_vars)), data = tdc_data),
+    "velocity-adjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PV +", base_vars, "+", adj_vars)), data = tdc_data),
+    
+    # recent only models 
+    "recent-unadjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PR +", base_vars)), data = tdc_data),
+    "recent-adjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PR +", base_vars, "+", adj_vars)), data = tdc_data),
+    
+    # recent + velocity models 
+    "recent-velocity-unadjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PR + PV +", base_vars)), data = tdc_data),
+    "recent-velocity-adjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PR + PV +", base_vars, "+", adj_vars)), data = tdc_data),
+    
+    # last only models 
+    "last-unadjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PL +", base_vars)), data = tdc_data),
+    "last-adjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PL +", base_vars, "+", adj_vars)), data = tdc_data),
+    
+    # baseline + last models
+    "baseline-last-unadjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PB + PL + ", base_vars)), data = tdc_data),
+    "baseline-last-adjusted" = coxph(as.formula(paste("Surv(tstart, tstop, event) ~ PB + PL +", base_vars, "+", adj_vars)), data = tdc_data)
+  )
+  
+  # tidy all models into one df
+  all_models <- map_dfr(models, tidy, .id = "model")
+  
+  # process and format
+  proteins_summary <- all_models %>%
+    filter(term %in% c("PB", "PR", "PV", "PL")) %>%
+    mutate(
+      protein = protein_col,
+      outcome = outcome_col,
+      HR = exp(estimate),
+      CI_lower = exp(estimate - 1.96 * std.error),
+      CI_upper = exp(estimate + 1.96 * std.error),
+      CI = paste0("[", round(CI_lower, 3), ", ", round(CI_upper, 3), "]"),
+      estimate = round(estimate, 3),
+      HR = round(HR, 3),
+      std.error = round(std.error, 3),
+      signif = case_when(
+        p.value < 0.001 ~ "***",
+        p.value < 0.01  ~ "**",
+        p.value < 0.05  ~ "*",
+        p.value < 0.1   ~ ".",
+        TRUE            ~ ""
+      ),
+      p.value = ifelse(p.value < 0.001,
+                       formatC(p.value, format = "e", digits = 2),
+                       formatC(p.value, format = "f", digits = 3))
+    ) %>%
+    select(protein, outcome, model, term, estimate, HR, CI, std.error, p.value, signif)
+  
+  return(proteins_summary)
+}
+
+# apply to all proteins
+breast_models_summary <- map_dfr(breast_seq_ids, ~{
+  tryCatch({
+    fit_tdc_models(.x, "case")
+  }, error = function(e) {
+    message(paste("Failed for protein:", .x, "-", e$message))
+    NULL
+  })
+})
+
+breast_models_summary
+
+```
+
+
+Write results to csv 
+```{r}
+write_csv(breast_models_summary, "breast_models_summary.csv")
+```
